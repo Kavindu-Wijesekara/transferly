@@ -1,162 +1,158 @@
-"""Download helpers and URL input flows."""
+"""Download helpers, filename detection, and URL input flows."""
 
 from __future__ import annotations
 
-import importlib
+import email.message
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import questionary
-import requests as std_requests
-from rich import print
+import requests
 from rich.console import Console
 from rich.panel import Panel
 
-if importlib.util.find_spec("curl_cffi") is not None:
-    cf_requests = importlib.import_module("curl_cffi.requests")
-    CURL_CFFI_AVAILABLE = True
-else:
-    cf_requests = None
-    CURL_CFFI_AVAILABLE = False
+from .auth import AuthConfig, prompt_auth
+from .config import load_config
+from .processes import run_checked
+from .logging import log_event
+from .security import sanitize_text, sanitize_url
 
 console = Console()
+RETRYABLE_STATUS_MARKERS = ("401", "403", "429", "503")
+BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36"
+
+
+@dataclass
+class UrlEntry:
+    url: str
+    filename: str
+    auth: AuthConfig
 
 
 def run(cmd: list[str], silent: bool = False) -> bool:
-    try:
-        kwargs = {}
-        if silent:
-            kwargs["stdout"] = subprocess.DEVNULL
-            kwargs["stderr"] = subprocess.DEVNULL
-        subprocess.run(cmd, check=True, **kwargs)
-        return True
-    except subprocess.CalledProcessError:
-        return False
-
-
-def run_shell(cmd: str) -> bool:
-    try:
-        subprocess.run(cmd, shell=True, check=True)
-        return True
-    except subprocess.CalledProcessError:
-        return False
+    stdout = subprocess.DEVNULL if silent else None
+    stderr = subprocess.DEVNULL if silent else None
+    return subprocess.run(cmd, stdout=stdout, stderr=stderr).returncode == 0
 
 
 def run_output(cmd: list[str]) -> str:
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    return r.stdout.strip()
+    result = run_checked(cmd, capture_output=True)
+    return result.stdout.strip() if result.stdout else ""
 
 
-def detect_filename(url: str) -> str:
-    """Follow redirects and extract final filename from URL path."""
+def _filename_from_content_disposition(value: str | None) -> str | None:
+    if not value:
+        return None
+    msg = email.message.Message()
+    msg["content-disposition"] = value
+    filename = msg.get_filename()
+    return Path(filename).name if filename else None
+
+
+def _filename_from_url(url: str) -> str | None:
+    name = Path(unquote(urlparse(url).path)).name
+    return name or None
+
+
+def detect_filename(url: str, auth: AuthConfig | None = None) -> str | None:
+    """Return filename from Content-Disposition, final redirect URL, or None."""
+    headers = {}
+    if auth:
+        for header in auth.header_lines():
+            if ":" in header:
+                key, value = header.split(":", 1)
+                headers[key.strip()] = value.strip()
     try:
-        r = std_requests.get(url, allow_redirects=True, stream=True, timeout=10)
-        final_url = r.url
-        name = Path(urlparse(final_url).path).name
-        return name if name else "download"
-    except Exception:
-        name = Path(urlparse(url).path).name
-        return name if name else "download"
+        response = requests.get(url, headers=headers, allow_redirects=True, stream=True, timeout=15)
+        return _filename_from_content_disposition(response.headers.get("Content-Disposition")) or _filename_from_url(response.url)
+    except requests.RequestException:
+        return _filename_from_url(url)
 
 
 def is_cloudflare_blocked(file_path: str) -> bool:
-    """Check if a downloaded file is actually a Cloudflare challenge page."""
     try:
-        p = Path(file_path)
-        if not p.exists() or p.stat().st_size > 100_000:
+        path = Path(file_path)
+        if not path.exists() or path.stat().st_size > 100_000:
             return False
-        content = p.read_text(errors="ignore").lower()
-        markers = ["just a moment", "cf-browser-verification", "enable javascript", "checking your browser"]
-        return any(m in content for m in markers)
+        content = path.read_text(errors="ignore").lower()
+        return any(marker in content for marker in ["just a moment", "cf-browser-verification", "enable javascript", "checking your browser"])
     except Exception:
         return False
 
 
-def download_aria2c(url: str, filename: str) -> bool:
-    """Primary downloader using aria2c."""
-    console.print("[cyan]⬇  Trying aria2c...[/cyan]")
-    success = run([
-        "aria2c", "-o", filename, "-x", "4", "-s", "4", "--min-split-size=50M",
-        "--retry-wait=5", "--max-tries=3", "--auto-file-renaming=false", url,
-    ])
-    if not success:
-        return False
-    if is_cloudflare_blocked(filename):
+def _aria2_base(filename: str, auth: AuthConfig, extra: list[str] | None = None) -> list[str]:
+    cfg = load_config()
+    download_dir = Path(cfg.get("download_directory") or ".").expanduser()
+    download_dir.mkdir(parents=True, exist_ok=True)
+    return [
+        "aria2c", "--dir", str(download_dir), "-o", filename, "-x", "8", "-s", "8",
+        "--continue=true", "--min-split-size=50M", "--retry-wait=5", "--max-tries=3",
+        "--auto-file-renaming=false", *(extra or []), *auth.aria2_args(),
+    ]
+
+
+def _run_strategy(label: str, cmd: list[str], filename: str) -> tuple[bool, bool]:
+    console.print(f"[cyan]⬇  Trying {label}...[/cyan]")
+    result = run_checked(cmd, capture_output=True)
+    output = sanitize_text((result.stdout or "") + (result.stderr or ""))
+    if result.returncode == 0 and not is_cloudflare_blocked(filename):
+        log_event("download", f"{label} completed for {filename}")
+        return True, False
+    if output:
+        log_event("error", output[-2000:])
+        console.print(f"[red]{output[-800:]}[/red]")
+    retryable = any(marker in output for marker in RETRYABLE_STATUS_MARKERS)
+    return False, retryable or result.returncode != 0
+
+
+def smart_download(url: str, filename: str, auth: AuthConfig | None = None) -> bool:
+    """Try aria2 strategies, then wget fallback, delegating transfer work externally."""
+    auth = auth or AuthConfig()
+    strategies = [
+        ("aria2 direct", _aria2_base(filename, auth) + [url]),
+        ("aria2 browser User-Agent", _aria2_base(filename, auth, ["--user-agent", BROWSER_UA]) + [url]),
+        ("aria2 with custom headers", _aria2_base(filename, auth) + [url]),
+        ("wget fallback", ["wget", "-c", "-O", filename, *auth.wget_args(), url]),
+    ]
+    for label, cmd in strategies:
+        ok, should_continue = _run_strategy(label, cmd, filename)
+        if ok:
+            return True
         Path(filename).unlink(missing_ok=True)
-        return False
-    return True
+        if not should_continue:
+            break
+    return False
 
 
-def download_curl_cffi(url: str, filename: str) -> bool:
-    """Fallback downloader using curl_cffi (bypasses Cloudflare JS challenges)."""
-    if not CURL_CFFI_AVAILABLE:
-        console.print("[red]curl_cffi not installed. Run: pip install curl-cffi[/red]")
-        return False
-
-    console.print("[yellow]⬇  aria2c failed or blocked. Trying curl_cffi (CF bypass)...[/yellow]")
-    try:
-        with cf_requests.Session(impersonate="chrome120") as session:  # type: ignore[name-defined]
-            r = session.get(url, stream=True, timeout=30)
-            r.raise_for_status()
-            total = int(r.headers.get("content-length", 0))
-            downloaded = 0
-            with open(filename, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if total:
-                            pct = downloaded / total * 100
-                            print(f"\r  [green]{pct:.1f}%[/green] — {downloaded // (1024*1024)} MB / {total // (1024*1024)} MB", end="")
-            print()
-        return True
-    except Exception as e:
-        console.print(f"[red]curl_cffi failed: {e}[/red]")
-        return False
-
-
-def smart_download(url: str, filename: str) -> bool:
-    """Try aria2c first, fall back to curl_cffi on failure."""
-    if download_aria2c(url, filename):
-        return True
-    return download_curl_cffi(url, filename)
-
-
-def collect_urls() -> list[dict[str, str]]:
-    """Collect one or more URLs via multiline paste."""
-    console.print(Panel(
-        "[dim]Paste one or more URLs (one per line).\nPress [bold]Enter twice[/bold] (blank line) when done.[/dim]",
-        title="URL Input",
-        border_style="cyan",
-    ))
-
+def collect_urls() -> list[UrlEntry]:
+    console.print(Panel("[dim]Paste one or more URLs (one per line).\nPress [bold]Enter twice[/bold] when done.[/dim]", title="URL Input", border_style="cyan"))
     lines: list[str] = []
     while True:
         try:
             line = input()
         except EOFError:
             break
-        if line.strip() == "":
-            if lines:
-                break
-        else:
+        if not line.strip() and lines:
+            break
+        if line.strip():
             lines.append(line.strip())
-
-    urls = [line for line in lines if line.startswith("http")]
+    urls = [line for line in lines if line.startswith(("http://", "https://"))]
     if not urls:
         console.print("[red]No valid URLs found.[/red]")
         return []
-
-    console.print(f"\n[green]Found {len(urls)} URL(s)[/green]\n")
-    entries: list[dict[str, str]] = []
+    auth = prompt_auth()
+    entries: list[UrlEntry] = []
     for url in urls:
-        detected = detect_filename(url)
-        console.print(f"  [dim]URL:[/dim] {url[:70]}{'...' if len(url) > 70 else ''}")
-        console.print(f"  [dim]Detected filename:[/dim] [bold]{detected}[/bold]")
-        rename = questionary.text(f"  Rename? (leave empty to keep '{detected}')").ask()
-        filename = rename.strip() if rename and rename.strip() else detected
-        entries.append({"url": url, "filename": filename})
-        console.print()
-
+        detected = detect_filename(url, auth)
+        console.print(f"  [dim]URL:[/dim] {sanitize_url(url)[:90]}")
+        if detected:
+            console.print(f"  [dim]Detected filename:[/dim] [bold]{detected}[/bold]")
+            rename = questionary.text(f"  Rename? (leave empty to keep '{detected}')").ask()
+            filename = rename.strip() if rename and rename.strip() else detected
+        else:
+            filename = questionary.text("Filename could not be detected. Enter filename:").ask()
+        if filename:
+            entries.append(UrlEntry(url=url, filename=filename, auth=auth))
     return entries

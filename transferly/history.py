@@ -1,8 +1,8 @@
-"""Transfer history persistence and display."""
+"""SQLite transfer history persistence and display."""
 
 from __future__ import annotations
 
-import json
+import sqlite3
 from datetime import datetime
 from typing import Any
 
@@ -10,49 +10,73 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
-from .config import HISTORY_FILE, ensure_config_dir
+from .config import HISTORY_FILE, ensure_config_dir, load_config
+from .security import sanitize_url
 
 console = Console()
 
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS transfers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    source_url TEXT,
+    filename TEXT NOT NULL,
+    remote TEXT,
+    destination TEXT,
+    transfer_type TEXT NOT NULL,
+    status TEXT NOT NULL
+)
+"""
+
+
+def _connect() -> sqlite3.Connection:
+    ensure_config_dir()
+    conn = sqlite3.connect(HISTORY_FILE)
+    conn.execute(SCHEMA)
+    return conn
+
 
 def append_history(entry: dict[str, Any]) -> None:
-    ensure_config_dir()
-    history: list[dict[str, Any]] = []
-    if HISTORY_FILE.exists():
-        try:
-            history = json.loads(HISTORY_FILE.read_text())
-        except Exception:
-            history = []
-    entry.setdefault("timestamp", datetime.now().isoformat())
-    history.append(entry)
-    HISTORY_FILE.write_text(json.dumps(history, indent=2))
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO transfers (timestamp, source_url, filename, remote, destination, transfer_type, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                entry.get("timestamp", datetime.now().isoformat()),
+                sanitize_url(entry.get("source_url") or entry.get("url") or ""),
+                entry.get("filename", ""),
+                entry.get("remote", ""),
+                entry.get("destination", ""),
+                entry.get("transfer_type") or entry.get("action", "unknown"),
+                entry.get("status", "unknown"),
+            ),
+        )
 
 
 def view_history() -> None:
-    if not HISTORY_FILE.exists():
+    limit = int(load_config().get("history_limit", 20))
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT timestamp, transfer_type, filename, remote, destination, status
+            FROM transfers ORDER BY id DESC LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    if not rows:
         console.print("[dim]No history yet.[/dim]")
-        return
-
-    history = json.loads(HISTORY_FILE.read_text())
-    if not history:
-        console.print("[dim]History is empty.[/dim]")
         return
 
     table = Table(title="Transfer History", box=box.ROUNDED, show_lines=True)
     table.add_column("Time", style="dim", width=20)
-    table.add_column("Action", style="cyan", width=16)
-    table.add_column("File", style="bold", width=30)
+    table.add_column("Type", style="cyan", width=18)
+    table.add_column("File", style="bold", width=28)
+    table.add_column("Remote", width=14)
     table.add_column("Destination", width=28)
     table.add_column("Status", width=10)
-
-    for h in reversed(history[-20:]):
-        status_style = "green" if h.get("status") == "ok" else "red"
-        table.add_row(
-            h.get("timestamp", "")[:19],
-            h.get("action", ""),
-            h.get("filename", ""),
-            h.get("destination", "—"),
-            f"[{status_style}]{h.get('status', '?')}[/{status_style}]",
-        )
-
+    for timestamp, transfer_type, filename, remote, destination, status in rows:
+        status_style = "green" if status == "ok" else "red"
+        table.add_row(timestamp[:19], transfer_type, filename, remote or "—", destination or "—", f"[{status_style}]{status}[/{status_style}]")
     console.print(table)

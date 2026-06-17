@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import sys
-
 import questionary
 
 from .config import load_config, save_config
@@ -21,34 +19,25 @@ def list_dirs(remote: str, path: str = "") -> list[str]:
     return [directory.strip("/") for directory in out.splitlines()]
 
 
-def browse_remote(remote: str) -> str:
+def browse_remote(remote: str) -> str | None:
     current = ""
     cfg = load_config()
     last_folder = cfg.get("last_folder", {}).get(remote, "")
-
-    if last_folder:
-        use_last = questionary.confirm(f"Use last folder? [{remote}:{last_folder}]").ask()
-        if use_last:
-            return last_folder
-
+    if last_folder and questionary.confirm(f"Use last folder? [{remote}:{last_folder}]").ask():
+        return last_folder
     while True:
         dirs = list_dirs(remote, current)
-        choices = []
-        if current:
-            choices.append(".. (back)")
-        choices += dirs
-        choices += ["[Create folder]", "[Select this folder]", "[Cancel]"]
-
+        choices = ([".. (back)"] if current else []) + dirs + ["[Create folder]", "[Select this folder]", "[Cancel]"]
         choice = questionary.select(f"📁 {remote}:{current or '/'}", choices=choices).ask()
-
-        if choice == "[Cancel]":
-            sys.exit()
+        if choice in (None, "[Cancel]"):
+            return None
         if choice == ".. (back)":
             current = "/".join(current.split("/")[:-1])
         elif choice == "[Create folder]":
             name = questionary.text("Folder name:").ask()
-            run(["rclone", "mkdir", f"{remote}:{current}/{name}"])
-            current = f"{current}/{name}".strip("/")
+            if name:
+                run(["rclone", "mkdir", f"{remote}:{current}/{name}"])
+                current = f"{current}/{name}".strip("/")
         elif choice == "[Select this folder]":
             cfg.setdefault("last_folder", {})[remote] = current
             save_config(cfg)
