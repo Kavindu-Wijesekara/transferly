@@ -1,0 +1,4 @@
+questionary
+rich
+requests
+typer
