@@ -19,9 +19,9 @@ rsync -a --delete \
 "${VENV_DIR}/bin/pip" install --upgrade pip
 "${VENV_DIR}/bin/pip" install -r "${APP_DIR}/app/requirements.txt"
 
-cat > "${BIN_DIR}/tsf" <<EOF
+cat > "${BIN_DIR}/tsf" <<'EOF'
 #!/usr/bin/env bash
-PYTHONPATH="${APP_DIR}/app" exec "${VENV_DIR}/bin/python" -m transferly.cli "\$@"
+PYTHONPATH="${HOME}/.transferly/app" exec "${HOME}/.transferly/venv/bin/python" -m transferly.cli "$@"
 EOF
 chmod +x "${BIN_DIR}/tsf"
 
